@@ -1,0 +1,65 @@
+import torch
+import torch.nn as nn
+from typing import List
+
+
+class LayerwiseAttentionPooler(nn.Module):
+    """
+    Learns a weighted attention profile over hidden states from all layers
+    to create a behavior-sensitive pooled embedding.
+
+    Input: List of hidden states from all layers (L x [seq_len x hidden_dim])
+    Output: One pooled embedding vector [hidden_dim]
+    """
+
+    def __init__(self, num_layers: int, hidden_dim: int, pooling_type: str = "mean"):
+        """
+        Args:
+            num_layers: Number of layers in the transformer model.
+            hidden_dim: Hidden size per layer.
+            pooling_type: How to pool across sequence tokens ('mean' or 'cls').
+        """
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.pooling_type = pooling_type
+
+        # Trainable attention weights over L layers
+        self.attn_weights = nn.Parameter(torch.randn(num_layers))
+        nn.init.uniform_(self.attn_weights, a=0.0, b=0.02)
+
+    def forward(self, layerwise_hidden_states: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            layerwise_hidden_states: List of tensors, one per layer,
+                                     each of shape [seq_len, hidden_dim]
+        Returns:
+            pooled_embedding: Tensor of shape [hidden_dim]
+        """
+        assert len(layerwise_hidden_states) == self.num_layers, \
+            f"Expected {self.num_layers} layers, got {len(layerwise_hidden_states)}"
+
+        # Stack into shape [L, seq_len, hidden_dim]
+        stacked = torch.stack(layerwise_hidden_states, dim=0)  # [L, S, D]
+        attn = torch.softmax(self.attn_weights, dim=0).view(self.num_layers, 1, 1)  # [L,1,1]
+
+        # Weighted sum across layers
+        weighted = attn * stacked  # [L, S, D]
+        merged = weighted.sum(dim=0)  # [S, D]
+
+        # Sequence pooling
+        if self.pooling_type == "cls":
+            return merged[0]  # return [CLS] token equivalent
+        elif self.pooling_type == "mean":
+            return merged.mean(dim=0)  # mean over tokens
+        else:
+            raise ValueError(f"Unsupported pooling_type: {self.pooling_type}")
+
+
+from latent_pooling.attention_pooler import LayerwiseAttentionPooler
+
+# Example for a 30-layer LLM
+pooler = LayerwiseAttentionPooler(num_layers=30, hidden_dim=4096)
+
+# layerwise_hidden_states: list of 30 tensors, each [seq_len, 4096]
+pooled_vector = pooler(layerwise_hidden_states)  # => [4096]
