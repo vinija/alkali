@@ -1,0 +1,57 @@
+import os
+import json
+from typing import List, Dict, Tuple
+import random
+
+ALKALI_CATEGORIES = ["jailbreak", "control_generation", "performance_degradation"]
+ALKALI_SUBTYPES = {
+    "jailbreak": ["optimization_based", "long_tail"],
+    "control_generation": ["direct", "indirect"],
+    "performance_degradation": ["dataset_poisoning", "prompt_injection"]
+}
+
+class ALKALILoader:
+    def __init__(self, data_dir: str, seed: int = 42):
+        self.data_dir = data_dir
+        self.seed = seed
+        self.data = self._load_all()
+        random.seed(seed)
+
+    def _load_all(self) -> Dict[str, List[Dict]]:
+        all_data = {}
+        for category in ALKALI_CATEGORIES:
+            all_data[category] = []
+            for subtype in ALKALI_SUBTYPES[category]:
+                file_path = os.path.join(self.data_dir, f"{category}__{subtype}.json")
+                if not os.path.exists(file_path):
+                    print(f"[Warning] Missing: {file_path}")
+                    continue
+                with open(file_path, 'r') as f:
+                    examples = json.load(f)
+                    for ex in examples:
+                        ex["category"] = category
+                        ex["subtype"] = subtype
+                    all_data[category].extend(examples)
+        return all_data
+
+    def get_by_category(self, category: str) -> List[Dict]:
+        return self.data.get(category, [])
+
+    def get_all(self, shuffle: bool = True) -> List[Dict]:
+        combined = sum(self.data.values(), [])
+        if shuffle:
+            random.shuffle(combined)
+        return combined
+
+    def sample_triplets(self, num_triplets: int) -> List[Tuple[str, str, str]]:
+        """Returns (prompt, safe_output, adversarial_output) triplets."""
+        triplets = []
+        for category in ALKALI_CATEGORIES:
+            for sample in self.data.get(category, []):
+                if "safe_output" in sample and "adv_output" in sample:
+                    triplets.append((sample["prompt"], sample["safe_output"], sample["adv_output"]))
+        random.shuffle(triplets)
+        return triplets[:num_triplets]
+
+    def stats(self) -> Dict[str, int]:
+        return {cat: len(self.data[cat]) for cat in ALKALI_CATEGORIES}
