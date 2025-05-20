@@ -1,0 +1,110 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from typing import Dict
+
+from grace_trainer.loss import GRACELoss
+from latent_pooling.attention_pooler import LayerwiseAttentionPooler
+
+
+class GRACETrainer:
+    """
+    Main training loop for GRACE.
+    """
+
+    def __init__(self,
+                 llm_model,  # frozen transformer
+                 tokenizer,
+                 dataset,  # yields dicts with 'prompt', 'safe', 'unsafe', 'jailbreak'
+                 hidden_dim: int,
+                 num_layers: int,
+                 device: str = "cuda",
+                 lr: float = 2e-4,
+                 batch_size: int = 16):
+
+        self.device = device
+        self.llm = llm_model.eval().to(device)  # frozen backbone
+        for p in self.llm.parameters():
+            p.requires_grad = False
+
+        self.tokenizer = tokenizer
+        self.dataset = dataset
+        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        # Trainable modules
+        self.pooler = LayerwiseAttentionPooler(num_layers=num_layers, hidden_dim=hidden_dim).to(device)
+        self.policy_head = nn.Linear(hidden_dim, 1).to(device)
+        self.ref_head = nn.Linear(hidden_dim, 1).to(device)
+
+        self.loss_fn = GRACELoss()
+        self.optimizer = optim.Adam(
+            list(self.pooler.parameters()) +
+            list(self.policy_head.parameters()),
+            lr=lr
+        )
+
+    def get_layerwise_hidden(self, prompt, completion) -> list:
+        """
+        Returns a list of layerwise hidden states for prompt + completion.
+        Assumes LLM returns hidden states at all layers.
+        """
+        input_text = prompt + " " + completion
+        inputs = self.tokenizer(input_text, return_tensors='pt').to(self.device)
+        with torch.no_grad():
+            outputs = self.llm(**inputs, output_hidden_states=True, return_dict=True)
+        return [layer.squeeze(0) for layer in outputs.hidden_states]
+
+    def pooled_embed(self, prompt: str, output: str) -> torch.Tensor:
+        layers = self.get_layerwise_hidden(prompt, output)
+        return self.pooler(layers)  # shape: [hidden_dim]
+
+    def train_epoch(self, epoch: int = 0):
+        self.pooler.train()
+        self.policy_head.train()
+        self.ref_head.eval()
+
+        for step, batch in enumerate(self.dataloader):
+            prompt_list = batch["prompt"]
+            safe_out = batch["safe"]
+            unsafe_out = batch["unsafe"]
+            jb_out = batch["jailbreak"]
+
+            pooled = {'safe': [], 'unsafe': [], 'jailbreak': []}
+            prompt_input = []
+
+            for p, s, u, j in zip(prompt_list, safe_out, unsafe_out, jb_out):
+                pooled["safe"].append(self.pooled_embed(p, s))
+                pooled["unsafe"].append(self.pooled_embed(p, u))
+                pooled["jailbreak"].append(self.pooled_embed(p, j))
+                prompt_input.append(self.tokenizer(p, return_tensors='pt').input_ids.to(self.device).squeeze(0))
+
+            # Stack batches
+            for k in pooled:
+                pooled[k] = torch.stack(pooled[k])  # [B, D]
+            prompt_input = torch.stack(prompt_input)  # [B, S]
+
+            # Loss + backward
+            loss_vals = self.loss_fn(pooled, self.policy_head, self.ref_head, prompt_input)
+            loss = loss_vals["total"]
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            if step % 10 == 0:
+                print(f"[Epoch {epoch}] Step {step} | "
+                      f"Total: {loss.item():.4f} | "
+                      f"Pref: {loss_vals['pref']:.4f}, "
+                      f"Sep: {loss_vals['sep']:.4f}, "
+                      f"Merge: {loss_vals['merge']:.4f}")
+
+    def save_model(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        torch.save(self.pooler.state_dict(), os.path.join(path, "pooler.pt"))
+        torch.save(self.policy_head.state_dict(), os.path.join(path, "policy.pt"))
+
+    def load_model(self, path: str):
+        self.pooler.load_state_dict(torch.load(os.path.join(path, "pooler.pt")))
+        self.policy_head.load_state_dict(torch.load(os.path.join(path, "policy.pt")))
