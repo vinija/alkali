@@ -1,0 +1,100 @@
+import os
+import json
+import torch
+from typing import Dict, List
+from tqdm import tqdm
+from collections import defaultdict
+
+from latent_pooling.attention_pooler import LayerwiseAttentionPooler
+from avqi_metric.avqi import AVQI
+
+
+class GRACEEvaluator:
+    """
+    Evaluation runner for computing ASR, AVQI, latent geometry before and after GRACE.
+    """
+
+    def __init__(self,
+                 model,
+                 tokenizer,
+                 pooler: LayerwiseAttentionPooler,
+                 dataset,
+                 label_fn,
+                 attack_families: List[str],
+                 device: str = "cuda"):
+        self.model = model.eval().to(device)
+        self.tokenizer = tokenizer
+        self.pooler = pooler.eval().to(device)
+        self.dataset = dataset
+        self.label_fn = label_fn  # function(prompt) -> should_refuse (bool)
+        self.attack_families = attack_families
+        self.device = device
+
+    def _compute_embedding(self, prompt: str, output: str) -> torch.Tensor:
+        """Pooled embedding via attention over hidden states."""
+        inputs = self.tokenizer(prompt + " " + output, return_tensors='pt').to(self.device)
+        with torch.no_grad():
+            out = self.model(**inputs, output_hidden_states=True, return_dict=True)
+            layers = [h.squeeze(0) for h in out.hidden_states]
+        return self.pooler(layers)
+
+    def evaluate(self, save_path: str = None, post_grace: bool = False) -> Dict:
+        """
+        Compute AVQI and ASR across the dataset. Optionally log results.
+        """
+        cluster_vectors = defaultdict(list)
+        per_attack_asr = defaultdict(lambda: [0, 0])  # hit, total
+
+        print("Evaluating...", "POST-GRACE" if post_grace else "PRE-GRACE")
+        for sample in tqdm(self.dataset):
+            prompt, y_safe, y_unsafe, y_jb = sample["prompt"], sample["safe"], sample["unsafe"], sample["jailbreak"]
+            attack_type = sample.get("attack_family", "unknown")
+
+            h_s = self._compute_embedding(prompt, y_safe)
+            h_u = self._compute_embedding(prompt, y_unsafe)
+            h_j = self._compute_embedding(prompt, y_jb)
+
+            cluster_vectors["safe"].append(h_s)
+            cluster_vectors["unsafe"].append(h_u)
+            cluster_vectors["jailbreak"].append(h_j)
+
+            # ASR for jailbreak only
+            if not self.label_fn(prompt + " " + y_jb):
+                per_attack_asr[attack_type][0] += 1
+            per_attack_asr[attack_type][1] += 1
+
+        # Compute AVQI metrics
+        avqi = AVQI()
+        avqi.add_cluster("safe", cluster_vectors["safe"])
+        avqi.add_cluster("unsafe", cluster_vectors["unsafe"])
+        avqi.add_cluster("jailbreak", cluster_vectors["jailbreak"])
+        avqi_score = avqi.compute_raw_avqi()
+
+        # Cluster geometry diagnostics
+        dist_su = avqi._centroid_dist(avqi.cluster_centroids["safe"], avqi.cluster_centroids["unsafe"])
+        dist_sj = avqi._centroid_dist(avqi.cluster_centroids["safe"], avqi.cluster_centroids["jailbreak"])
+        diam_safe = avqi.cluster_diameters["safe"]
+        diam_jb = avqi.cluster_diameters["jailbreak"]
+
+        # Per-attack ASR
+        attack_results = {
+            k: {"ASR": round(hit / total * 100, 2), "hit": hit, "total": total}
+            for k, (hit, total) in per_attack_asr.items()
+        }
+
+        results = {
+            "AVQI": avqi_score,
+            "geometry": {
+                "centroid_dist_safe_unsafe": round(dist_su, 4),
+                "centroid_dist_safe_jb": round(dist_sj, 4),
+                "diam_safe": round(diam_safe, 4),
+                "diam_jb": round(diam_jb, 4)
+            },
+            "attack_ASR": attack_results
+        }
+
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, 'w') as f:
+                json.dump(results, f, indent=2)
+        return results
