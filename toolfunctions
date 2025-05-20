@@ -1,0 +1,103 @@
+import os
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+from mpl_toolkits.mplot3d import Axes3D
+
+
+def _prepare_matrix(cluster_vectors: dict[str, list[torch.Tensor]]) -> tuple:
+    labels, data = [], []
+    for label, vecs in cluster_vectors.items():
+        for v in vecs:
+            data.append(v.cpu().numpy())
+            labels.append(label)
+    return torch.tensor(data), labels
+
+
+def _project(data, dim=2, method="pca"):
+    if method == "pca":
+        reducer = PCA(n_components=dim)
+    elif method == "tsne":
+        reducer = TSNE(n_components=dim, perplexity=30, n_iter=1500)
+    else:
+        raise ValueError("Unsupported projection method")
+    data = StandardScaler().fit_transform(data)
+    return reducer.fit_transform(data)
+
+
+def plot_2d_latent_clusters(cluster_vectors: dict[str, list[torch.Tensor]],
+                             save_path: str = "outputs/latent_2d.png",
+                             method: str = "pca",
+                             show_centroids: bool = True,
+                             palette: dict = None):
+    """
+    2D PCA or t-SNE plot of pooled embeddings with class labels and centroids.
+    """
+    data_tensor, labels = _prepare_matrix(cluster_vectors)
+    X = _project(data_tensor.numpy(), dim=2, method=method)
+
+    plt.figure(figsize=(10, 8))
+    unique_labels = sorted(set(labels))
+    if palette is None:
+        palette = {label: sns.color_palette("tab10")[i] for i, label in enumerate(unique_labels)}
+
+    for label in unique_labels:
+        points = X[[i for i, l in enumerate(labels) if l == label]]
+        plt.scatter(points[:, 0], points[:, 1], label=label, alpha=0.6, s=40, color=palette[label])
+        if show_centroids:
+            centroid = points.mean(axis=0)
+            plt.scatter(centroid[0], centroid[1], marker='X', s=200, edgecolors='black',
+                        color=palette[label])
+
+    plt.title("Latent Space Projection (2D)", fontsize=14)
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.legend()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+
+
+def plot_3d_latent_clusters(cluster_vectors: dict[str, list[torch.Tensor]],
+                             save_path: str = "outputs/latent_3d.png",
+                             method: str = "pca",
+                             show_centroids: bool = True,
+                             palette: dict = None):
+    """
+    3D PCA/t-SNE scatter plot with centroids for latent geometry.
+    """
+    data_tensor, labels = _prepare_matrix(cluster_vectors)
+    X = _project(data_tensor.numpy(), dim=3, method=method)
+
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
+    unique_labels = sorted(set(labels))
+    if palette is None:
+        palette = {label: sns.color_palette("tab10")[i] for i, label in enumerate(unique_labels)}
+
+    for label in unique_labels:
+        idxs = [i for i, l in enumerate(labels) if l == label]
+        points = X[idxs]
+        ax.scatter(points[:, 0], points[:, 1], points[:, 2], label=label, alpha=0.6, s=35,
+                   color=palette[label])
+        if show_centroids:
+            centroid = points.mean(axis=0)
+            ax.scatter(*centroid, marker='X', s=220, color=palette[label], edgecolors='black')
+
+    ax.set_title("Latent Space Projection (3D)")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    ax.legend()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+
+
+
+
+latent_pooling/attention_pooler.py
+-------------------------------------------------
