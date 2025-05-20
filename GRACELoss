@@ -1,0 +1,92 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict
+
+
+class GRACELoss(nn.Module):
+    """
+    Implements the full GRACE objective:
+    1. Preference alignment loss in latent space
+    2. Safe–Adversarial separation constraint
+    3. Unsafe–Jailbreak merging constraint
+    """
+
+    def __init__(self,
+                 margin_separation: float = 5.0,
+                 margin_merge: float = 1.0,
+                 lambda_sep: float = 1.0,
+                 lambda_merge: float = 1.0,
+                 alpha: float = 0.9):
+        """
+        Args:
+            margin_separation: minimum distance between safe and [unsafe/jailbreak]
+            margin_merge: maximum distance allowed between unsafe and jailbreak
+            lambda_sep: weight on separation loss
+            lambda_merge: weight on merge loss
+            alpha: temperature or logit scaling for preference
+        """
+        super().__init__()
+        self.margin_separation = margin_separation
+        self.margin_merge = margin_merge
+        self.lambda_sep = lambda_sep
+        self.lambda_merge = lambda_merge
+        self.alpha = alpha
+
+    def preference_loss(self, h_safe, h_adv, policy, ref_policy, prompt_input):
+        """
+        Relaxed latent DPO loss using log-prob difference over safe/adv pooled hiddens.
+        h_safe, h_adv: [batch, hidden_dim]
+        """
+        logp_safe = policy(prompt_input, h_safe)  # shape: [batch]
+        logp_adv = policy(prompt_input, h_adv)    # shape: [batch]
+        logp_safe_ref = ref_policy(prompt_input, h_safe).detach()
+        logp_adv_ref = ref_policy(prompt_input, h_adv).detach()
+
+        margin = logp_safe - logp_adv - self.alpha * (logp_safe_ref - logp_adv_ref)
+        return -F.logsigmoid(margin).mean()
+
+    def separation_loss(self, h_safe, h_unsafe, h_jb) -> torch.Tensor:
+        """
+        Enforce minimum separation between safe and (unsafe + jailbreak)
+        """
+        d_su = F.pairwise_distance(h_safe, h_unsafe, p=2)
+        d_sj = F.pairwise_distance(h_safe, h_jb, p=2)
+        sep_su = F.relu(self.margin_separation - d_su)
+        sep_sj = F.relu(self.margin_separation - d_sj)
+        return (sep_su.mean() + sep_sj.mean()) / 2
+
+    def merge_loss(self, h_unsafe, h_jb) -> torch.Tensor:
+        """
+        Collapse unsafe and jailbreak completions into one adversarial subspace
+        """
+        d_uj = F.pairwise_distance(h_unsafe, h_jb, p=2)
+        return F.relu(d_uj - self.margin_merge).mean()
+
+    def forward(self,
+                pooled_embeddings: Dict[str, torch.Tensor],
+                policy,
+                ref_policy,
+                prompt_input) -> torch.Tensor:
+        """
+        Main GRACE loss wrapper.
+        pooled_embeddings: {
+            'safe': [B, D], 'unsafe': [B, D], 'jailbreak': [B, D]
+        }
+        """
+        h_s = pooled_embeddings['safe']
+        h_u = pooled_embeddings['unsafe']
+        h_j = pooled_embeddings['jailbreak']
+
+        loss_pref = self.preference_loss(h_s, h_u, policy, ref_policy, prompt_input)
+        loss_sep = self.separation_loss(h_s, h_u, h_j)
+        loss_merge = self.merge_loss(h_u, h_j)
+
+        total = loss_pref + self.lambda_sep * loss_sep + self.lambda_merge * loss_merge
+
+        return {
+            'total': total,
+            'pref': loss_pref.item(),
+            'sep': loss_sep.item(),
+            'merge': loss_merge.item()
+        }
