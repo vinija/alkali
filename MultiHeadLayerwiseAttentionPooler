@@ -1,0 +1,83 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Literal
+
+
+class MultiHeadLayerwiseAttentionPooler(nn.Module):
+    """
+    Enhanced GRACE Pooler for NeurIPS-level latent alignment.
+    
+    Features:
+    - Multi-head attention over transformer layers
+    - Softmax with temperature control
+    - Token-level pooling strategies: mean, cls, max
+    - Optional residual fusion with naïve mean pooling
+    - Projection from multi-head to fixed output dimension
+    """
+
+    def __init__(self,
+                 num_layers: int,
+                 hidden_dim: int,
+                 num_heads: int = 4,
+                 pooling_type: Literal["mean", "cls", "max"] = "mean",
+                 temperature: float = 1.0,
+                 residual_fusion: bool = True):
+        """
+        Args:
+            num_layers: Total layers from frozen LLM
+            hidden_dim: Hidden size per token
+            num_heads: Attention heads over layers (not tokens)
+            pooling_type: How to pool token dimension - "mean", "cls", or "max"
+            temperature: Temperature scaling before softmax
+            residual_fusion: If True, add skip connection with global mean
+        """
+        super().__init__()
+        self.L = num_layers
+        self.D = hidden_dim
+        self.H = num_heads
+        self.pooling_type = pooling_type
+        self.temperature = temperature
+        self.residual_fusion = residual_fusion
+
+        # [H, L] attention weights over transformer layers
+        self.attn_weights = nn.Parameter(torch.randn(self.H, self.L))
+        nn.init.xavier_uniform_(self.attn_weights)
+
+        # Projection to match hidden dimension
+        self.proj = nn.Linear(self.H * self.D, self.D)
+
+    def forward(self, hidden_states: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: list of [seq_len, hidden_dim] for each transformer layer
+        Returns:
+            A single [hidden_dim] pooled representation
+        """
+        assert len(hidden_states) == self.L, f"Expected {self.L} layers, got {len(hidden_states)}"
+        stacked = torch.stack(hidden_states, dim=0)  # [L, S, D]
+        S = stacked.shape[1]  # sequence length
+        heads = []
+
+        for h in range(self.H):
+            alpha = F.softmax(self.attn_weights[h] / self.temperature, dim=0)  # [L]
+            merged = torch.sum(alpha[:, None, None] * stacked, dim=0)  # [S, D]
+
+            if self.pooling_type == "mean":
+                pooled = merged.mean(dim=0)
+            elif self.pooling_type == "cls":
+                pooled = merged[0]
+            elif self.pooling_type == "max":
+                pooled, _ = merged.max(dim=0)
+            else:
+                raise ValueError(f"Unknown pooling type: {self.pooling_type}")
+            heads.append(pooled)
+
+        concatenated = torch.cat(heads, dim=-1)  # [H*D]
+        output = self.proj(concatenated)         # [D]
+
+        if self.residual_fusion:
+            naive_mean = torch.stack([layer.mean(dim=0) for layer in hidden_states]).mean(dim=0)
+            output = output + naive_mean
+
+        return output
